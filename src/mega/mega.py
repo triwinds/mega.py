@@ -1,30 +1,41 @@
-import math
-import re
+import binascii
+import hashlib
 import json
 import logging
+import math
+import os
+import random
+import re
 import secrets
+import tempfile
 from pathlib import Path
-import hashlib
+from typing import List, Dict
+
+import requests
 from Crypto.Cipher import AES
 from Crypto.PublicKey import RSA
 from Crypto.Util import Counter
-import os
-import random
-import binascii
-import tempfile
-import shutil
-
-import requests
 from tenacity import retry, wait_exponential, retry_if_exception_type
 
-from .errors import ValidationError, RequestError
 from .crypto import (a32_to_base64, encrypt_key, base64_url_encode,
                      encrypt_attr, base64_to_a32, base64_url_decode,
                      decrypt_attr, a32_to_str, get_chunks, str_to_a32,
                      decrypt_key, mpi_to_int, stringhash, prepare_key, make_id,
                      makebyte, modular_inverse)
+from .errors import ValidationError, RequestError
 
 logger = logging.getLogger(__name__)
+
+
+class DownloadContext:
+    k: str
+    iv: List
+    file_size: int
+    meta_mac: str
+    file_url: str
+    file_data: Dict
+    attribs: Dict
+    filename: str
 
 
 class Mega:
@@ -83,13 +94,13 @@ class Mega:
 
         user = self._api_request({
             'a':
-            'up',
+                'up',
             'k':
-            a32_to_base64(encrypt_key(master_key, password_key)),
+                a32_to_base64(encrypt_key(master_key, password_key)),
             'ts':
-            base64_url_encode(
-                a32_to_str(session_self_challenge) +
-                a32_to_str(encrypt_key(session_self_challenge, master_key)))
+                base64_url_encode(
+                    a32_to_str(session_self_challenge) +
+                    a32_to_str(encrypt_key(session_self_challenge, master_key)))
         })
 
         resp = self._api_request({'a': 'us', 'user': user})
@@ -610,20 +621,15 @@ class Mega:
 
         node_id = node_data['h']
         request_body = [{
-            'a':
-            's2',
-            'n':
-            node_id,
+            'a': 's2',
+            'n': node_id,
             's': [{
                 'u': 'EXP',
                 'r': 0
             }],
-            'i':
-            self.request_id,
-            'ok':
-            ok,
-            'ha':
-            ha,
+            'i': self.request_id,
+            'ok': ok,
+            'ha': ha,
             'cr': [[node_id], [node_id], [0, 0, encrypted_node_key]]
         }]
         self._api_request(request_body)
@@ -652,6 +658,39 @@ class Mega:
                        dest_filename=None,
                        is_public=False,
                        file=None):
+        context = self._get_download_context(file_handle, file_key, is_public, file)
+        if dest_filename is not None:
+            file_name = dest_filename
+        else:
+            file_name = context.attribs['n']
+        # input_file = requests.get(context.file_url, stream=True).raw
+        from .downloader import download
+        tmp_file = tempfile.NamedTemporaryFile(mode='w+b', prefix='megapy_', delete=False)
+        tmp_file.close()
+        tmp_file_path = Path(tmp_file.name)
+        try:
+            input_file_path = download(context.file_url, Path(tmp_file.name))
+            if dest_path is None:
+                dest_path = ''
+            else:
+                dest_path += '/'
+            with open(input_file_path, 'rb+') as input_file:
+                return self._write_file(context, input_file, Path(dest_path + file_name))
+        finally:
+            os.remove(tmp_file_path)
+
+    def get_context_by_url(self, url) -> DownloadContext:
+        path = self._parse_url(url).split('!')
+        file_id = path[0]
+        file_key = path[1]
+        return self._get_download_context(file_handle=file_id, file_key=file_key, is_public=True)
+
+    def _get_download_context(self,
+                              file_handle,
+                              file_key,
+                              is_public=False,
+                              file=None) -> DownloadContext:
+        result = DownloadContext()
         if file is None:
             if is_public:
                 file_key = base64_to_a32(file_key)
@@ -676,35 +715,26 @@ class Mega:
             k = file['k']
             iv = file['iv']
             meta_mac = file['meta_mac']
-
-        # Seems to happens sometime... When this occurs, files are
-        # inaccessible also in the official also in the official web app.
-        # Strangely, files can come back later.
         if 'g' not in file_data:
             raise RequestError('File not accessible anymore')
         file_url = file_data['g']
         file_size = file_data['s']
         attribs = base64_url_decode(file_data['at'])
-        attribs = decrypt_attr(attribs, k)
+        result.attribs = decrypt_attr(attribs, k)
+        result.k = k
+        result.iv = iv
+        result.file_size = file_size
+        result.meta_mac = meta_mac
+        result.file_url = file_url
+        result.file_data = file_data
+        result.filename = result.attribs
+        return result
 
-        if dest_filename is not None:
-            file_name = dest_filename
-        else:
-            file_name = attribs['n']
-
-        input_file = requests.get(file_url, stream=True).raw
-
-        if dest_path is None:
-            dest_path = ''
-        else:
-            dest_path += '/'
-
-        with tempfile.NamedTemporaryFile(mode='w+b',
-                                         prefix='megapy_',
-                                         delete=False) as temp_output_file:
-            k_str = a32_to_str(k)
-            counter = Counter.new(128,
-                                  initial_value=((iv[0] << 32) + iv[1]) << 64)
+    def _write_file(self, context: DownloadContext, input_file, output_path):
+        with open(output_path, 'w+b') as output_file:
+            iv = context.iv
+            k_str = a32_to_str(context.k)
+            counter = Counter.new(128, initial_value=((iv[0] << 32) + iv[1]) << 64)
             aes = AES.new(k_str, AES.MODE_CTR, counter=counter)
 
             mac_str = '\0' * 16
@@ -712,37 +742,29 @@ class Mega:
                                     mac_str.encode("utf8"))
             iv_str = a32_to_str([iv[0], iv[1], iv[0], iv[1]])
 
-            for chunk_start, chunk_size in get_chunks(file_size):
+            for chunk_start, chunk_size in get_chunks(context.file_size):
                 chunk = input_file.read(chunk_size)
                 chunk = aes.decrypt(chunk)
-                temp_output_file.write(chunk)
+                output_file.write(chunk)
 
                 encryptor = AES.new(k_str, AES.MODE_CBC, iv_str)
                 for i in range(0, len(chunk) - 16, 16):
                     block = chunk[i:i + 16]
                     encryptor.encrypt(block)
-
                 # fix for files under 16 bytes failing
-                if file_size > 16:
+                if context.file_size > 16:
                     i += 16
                 else:
                     i = 0
-
                 block = chunk[i:i + 16]
                 if len(block) % 16:
                     block += b'\0' * (16 - (len(block) % 16))
                 mac_str = mac_encryptor.encrypt(encryptor.encrypt(block))
-
-                file_info = os.stat(temp_output_file.name)
-                logger.info('%s of %s downloaded', file_info.st_size,
-                            file_size)
             file_mac = str_to_a32(mac_str)
             # check mac integrity
             if (file_mac[0] ^ file_mac[1],
-                    file_mac[2] ^ file_mac[3]) != meta_mac:
+                file_mac[2] ^ file_mac[3]) != context.meta_mac:
                 raise ValueError('Mismatched mac')
-            output_path = Path(dest_path + file_name)
-            shutil.move(temp_output_file.name, output_path)
             return output_path
 
     def upload(self, filename, dest=None, dest_filename=None):
@@ -831,11 +853,11 @@ class Mega:
             # update attributes
             data = self._api_request({
                 'a':
-                'p',
+                    'p',
                 't':
-                dest,
+                    dest,
                 'i':
-                self.request_id,
+                    self.request_id,
                 'n': [{
                     'h': completion_file_handle,
                     't': 0,
@@ -858,9 +880,9 @@ class Mega:
         # update attributes
         data = self._api_request({
             'a':
-            'p',
+                'p',
             't':
-            parent_node_id,
+                parent_node_id,
             'n': [{
                 'h': 'xxxxxxxx',
                 't': 1,
@@ -868,7 +890,7 @@ class Mega:
                 'k': encrypted_key
             }],
             'i':
-            self.request_id
+                self.request_id
         })
         return data
 
@@ -938,7 +960,7 @@ class Mega:
         # determine target_node_id
         if type(target) == int:
             target_node_id = str(self.get_node_by_type(target)[0])
-        elif type(target) in (str, ):
+        elif type(target) in (str,):
             target_node_id = target
         else:
             file = target[1]
@@ -1048,9 +1070,9 @@ class Mega:
         encrypted_name = base64_url_encode(encrypt_attr({'n': dest_name}, k))
         return self._api_request({
             'a':
-            'p',
+                'p',
             't':
-            dest_node['h'],
+                dest_node['h'],
             'n': [{
                 'ph': file_handle,
                 't': 0,
