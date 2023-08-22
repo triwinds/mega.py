@@ -1,6 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from pathlib import Path
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def _calc_divisional_range(filesize, chuck=10):
@@ -22,6 +26,7 @@ def _range_download(url, save_name, s_pos, e_pos):
         for chunk in res.iter_content(chunk_size=1024*1024):
             if chunk:
                 f.write(chunk)
+    logger.debug(f'segment {s_pos}-{e_pos} download finished.')
 
 
 def download(url, filename):
