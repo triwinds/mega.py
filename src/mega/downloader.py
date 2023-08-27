@@ -1,13 +1,20 @@
+import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from pathlib import Path
 import logging
+import multiprocessing
 
 
 logger = logging.getLogger(__name__)
+manager = multiprocessing.Manager()
+lock = manager.Lock()
 
 
 def _calc_divisional_range(filesize, chuck=10):
+    if filesize < 100:
+        return [[0, filesize]]
     step = filesize//chuck
     arr = list(range(0, filesize, step))
     result = []
@@ -21,12 +28,24 @@ def _calc_divisional_range(filesize, chuck=10):
 def _range_download(url, save_name, s_pos, e_pos):
     headers = {"Range": f"bytes={s_pos}-{e_pos}"}
     res = requests.get(url, headers=headers, stream=True)
-    with open(save_name, "rb+") as f:
-        f.seek(s_pos)
+    with tempfile.NamedTemporaryFile(mode='w+b', prefix='segment_') as f:
         for chunk in res.iter_content(chunk_size=1024*1024):
             if chunk:
                 f.write(chunk)
+            f.seek(0)
+            _write_file(save_name, s_pos, f)
     logger.debug(f'segment {s_pos}-{e_pos} download finished.')
+
+
+def _write_file(filepath, pos, tmp_file):
+    with lock:
+        with open(filepath, 'rb+') as f:
+            f.seek(pos)
+            while True:
+                chunk = tmp_file.read(16*1024*1024)
+                if not chunk:
+                    break
+                f.write(chunk)
 
 
 def download(url, filename):
